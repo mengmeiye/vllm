@@ -5,6 +5,10 @@ This guide covers configuration of the [`OffloadingConnector`](disagg_prefill.md
 !!! note
     The `OffloadingConnector` currently supports CUDA, ROCm, and XPU only.
 
+    The experimental two-pool hierarchy built on
+    `SimpleCPUOffloadConnector` has a separate
+    [configuration guide](simple_cpu_offload_emulator.md).
+
 ## Overview
 
 Two specs are available, selected by the `spec_name` key in `kv_connector_extra_config`:

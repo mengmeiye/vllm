@@ -58,6 +58,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
+from vllm.v1.simple_kv_offload.tier import CpuTierId
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -250,6 +251,9 @@ def make_scheduler(
     num_groups: int = 1,
     lazy: bool = False,
     kv_cache_config: KVCacheConfig | None = None,
+    fast_cpu_blocks: int = 0,
+    slow_cpu_blocks: int | None = None,
+    priority_threshold: int = 1,
 ) -> SchedulerFixture:
     """Build a SimpleCPUOffloadScheduler with small block pools."""
     if kv_cache_config is None:
@@ -258,6 +262,12 @@ def make_scheduler(
         num_groups = len(kv_cache_config.kv_cache_groups)
     vllm_config = _make_vllm_config()
     cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
+    fast_capacity_bytes = _BYTES_PER_BLOCK * fast_cpu_blocks * num_groups
+    slow_capacity_bytes = (
+        None
+        if slow_cpu_blocks is None
+        else _BYTES_PER_BLOCK * slow_cpu_blocks * num_groups
+    )
 
     sched = SimpleCPUOffloadScheduler(
         vllm_config=vllm_config,
@@ -266,6 +276,9 @@ def make_scheduler(
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         lazy_offload=lazy,
+        fast_cpu_capacity_bytes=fast_capacity_bytes,
+        slow_cpu_capacity_bytes=slow_capacity_bytes,
+        priority_threshold=priority_threshold,
     )
 
     # Build a real GPU block pool and bind it
@@ -292,6 +305,7 @@ def make_request(
     num_blocks: int = 2,
     request_id: str | None = None,
     extra_tokens: int = 1,
+    priority: int = 0,
 ) -> Request:
     """Create a Request with deterministic block hashes."""
     global _req_counter
@@ -311,6 +325,7 @@ def make_request(
         pooling_params=None,
         mm_features=None,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+        priority=priority,
     )
     return req
 
@@ -512,6 +527,124 @@ def test_eager_store_and_load_roundtrip() -> None:
     assert meta2.load_event >= 0, "Expected a load event to be assigned"
     assert len(meta2.load_gpu_blocks) > 0
     assert len(meta2.load_cpu_blocks) == len(meta2.load_gpu_blocks)
+
+
+def test_priority_routes_stores_to_independent_cpu_tiers() -> None:
+    fix = make_scheduler(
+        num_gpu_blocks=16,
+        fast_cpu_blocks=4,
+        slow_cpu_blocks=6,
+        priority_threshold=1,
+    )
+    sched = fix.scheduler
+    fast_req = make_request(num_blocks=1, priority=0)
+    slow_req = make_request(num_blocks=1, priority=5)
+    fast_blocks = _alloc_and_register(fix, fast_req, 1)
+    slow_blocks = _alloc_and_register(fix, slow_req, 1)
+    sched.update_state_after_alloc(fast_req, fast_blocks, 0)
+    sched.update_state_after_alloc(slow_req, slow_blocks, 0)
+
+    output = make_scheduler_output(
+        {
+            fast_req.request_id: BLOCK_SIZE,
+            slow_req.request_id: BLOCK_SIZE,
+        },
+        new_reqs={
+            fast_req.request_id: fast_blocks.get_block_ids(),
+            slow_req.request_id: slow_blocks.get_block_ids(),
+        },
+    )
+    metadata = sched.build_connector_meta(output)
+    transfers = {transfer.tier_id: transfer for transfer in metadata.store_transfers}
+
+    assert set(transfers) == {int(CpuTierId.FAST), int(CpuTierId.SLOW)}
+    assert transfers[int(CpuTierId.FAST)].gpu_blocks == fast_blocks.get_block_ids()[0]
+    assert transfers[int(CpuTierId.SLOW)].gpu_blocks == slow_blocks.get_block_ids()[0]
+    for transfer in metadata.store_transfers:
+        simulate_store_completion(sched, transfer.event)
+
+    fast_hash = fix.gpu_block_pool.blocks[
+        transfers[int(CpuTierId.FAST)].gpu_blocks[0]
+    ].block_hash
+    slow_hash = fix.gpu_block_pool.blocks[
+        transfers[int(CpuTierId.SLOW)].gpu_blocks[0]
+    ].block_hash
+    assert fast_hash is not None and slow_hash is not None
+    assert (
+        sched.cpu_tiers[
+            int(CpuTierId.FAST)
+        ].block_pool.cached_block_hash_to_block.get_one_block(fast_hash)
+        is not None
+    )
+    assert (
+        sched.cpu_tiers[
+            int(CpuTierId.SLOW)
+        ].block_pool.cached_block_hash_to_block.get_one_block(slow_hash)
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("fast_blocks", "slow_blocks", "expected_tier"),
+    [(1, 2, CpuTierId.SLOW), (2, 2, CpuTierId.FAST)],
+)
+def test_lookup_uses_longest_prefix_and_prefers_fast_ties(
+    fast_blocks: int, slow_blocks: int, expected_tier: CpuTierId
+) -> None:
+    fix = make_scheduler(
+        num_gpu_blocks=16,
+        fast_cpu_blocks=5,
+        slow_cpu_blocks=5,
+    )
+    sched = fix.scheduler
+    req = make_request(num_blocks=2)
+    fast_pool = sched.cpu_tiers[int(CpuTierId.FAST)].block_pool
+    slow_pool = sched.cpu_tiers[int(CpuTierId.SLOW)].block_pool
+    fast_cached = _allocate_gpu_blocks(fast_pool, req, fast_blocks)
+    slow_cached = _allocate_gpu_blocks(slow_pool, req, slow_blocks)
+    fast_pool.free_blocks(fast_cached)
+    slow_pool.free_blocks(slow_cached)
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req, 0)
+
+    assert hit_tokens == max(fast_blocks, slow_blocks) * BLOCK_SIZE
+    assert is_async
+    assert sched._pending_cpu_hit_tiers[req.request_id] == int(expected_tier)
+    sched.request_finished(req, [])
+
+
+def test_reset_clears_both_cpu_tiers() -> None:
+    fix = make_scheduler(
+        num_gpu_blocks=16,
+        fast_cpu_blocks=4,
+        slow_cpu_blocks=4,
+    )
+    sched = fix.scheduler
+    req = make_request(num_blocks=1)
+    block_hash = make_block_hash_with_group_id(req.block_hashes[0], 0)
+    assert block_hash is not None
+    for tier in sched.cpu_tiers.values():
+        blocks = _allocate_gpu_blocks(tier.block_pool, req, 1)
+        tier.block_pool.free_blocks(blocks)
+        assert (
+            tier.block_pool.cached_block_hash_to_block.get_one_block(block_hash)
+            is not None
+        )
+
+    assert sched.reset()
+    for tier in sched.cpu_tiers.values():
+        assert (
+            tier.block_pool.cached_block_hash_to_block.get_one_block(block_hash) is None
+        )
+
+
+def test_tier_must_hold_more_than_reserved_null_block() -> None:
+    with pytest.raises(ValueError, match="usable KV block pool"):
+        make_scheduler(
+            num_gpu_blocks=16,
+            fast_cpu_blocks=1,
+            slow_cpu_blocks=0,
+        )
 
 
 def test_prompt_logprobs_skip_cpu_cache_lookup() -> None:

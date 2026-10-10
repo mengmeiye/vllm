@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
+"""SimpleCPUOffloadConnector: local KV cache offloading and emulation."""
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -36,6 +36,7 @@ from vllm.v1.simple_kv_offload.metrics import (
     SimpleCPUOffloadPromMetrics,
     SimpleCPUOffloadStats,
 )
+from vllm.v1.simple_kv_offload.tier import DmaEmulationConfig
 from vllm.v1.simple_kv_offload.worker import (
     SimpleCPUOffloadWorker,
 )
@@ -83,23 +84,77 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
         extra_config = self._kv_transfer_config.kv_connector_extra_config or {}
 
-        cpu_capacity_bytes = int(
-            extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
-        )
-        # cpu_bytes_to_use is server-wide for compatibility;
-        # cpu_bytes_to_use_per_rank overrides for per-rank capacity.
         world_size = vllm_config.parallel_config.world_size
-        cpu_capacity_per_rank = cpu_capacity_bytes // world_size
-        if "cpu_bytes_to_use_per_rank" in extra_config:
-            explicit = int(extra_config["cpu_bytes_to_use_per_rank"])
-            if explicit != cpu_capacity_per_rank:
-                logger.warning(
-                    "cpu_bytes_to_use_per_rank (%.2f GB) != "
-                    "cpu_bytes_to_use/world_size (%.2f GB). Using per-rank value.",
-                    explicit / (1024**3),
-                    cpu_capacity_per_rank / (1024**3),
-                )
-            cpu_capacity_per_rank = explicit
+
+        def capacity_per_rank(total_key: str, per_rank_key: str, default: int) -> int:
+            total = int(extra_config.get(total_key, default))
+            if total < 0:
+                raise ValueError(f"{total_key} must be non-negative")
+            per_rank = total // world_size
+            if per_rank_key in extra_config:
+                explicit = int(extra_config[per_rank_key])
+                if explicit < 0:
+                    raise ValueError(f"{per_rank_key} must be non-negative")
+                if explicit != per_rank:
+                    logger.warning(
+                        "%s (%.2f GB) != %s/world_size (%.2f GB). "
+                        "Using per-rank value.",
+                        per_rank_key,
+                        explicit / (1024**3),
+                        total_key,
+                        per_rank / (1024**3),
+                    )
+                per_rank = explicit
+            return per_rank
+
+        using_explicit_tiers = any(
+            key in extra_config
+            for key in (
+                "fast_cpu_bytes",
+                "slow_cpu_bytes",
+                "fast_cpu_bytes_per_rank",
+                "slow_cpu_bytes_per_rank",
+            )
+        )
+        if using_explicit_tiers:
+            fast_capacity_per_rank = capacity_per_rank(
+                "fast_cpu_bytes", "fast_cpu_bytes_per_rank", 0
+            )
+            slow_capacity_per_rank = capacity_per_rank(
+                "slow_cpu_bytes", "slow_cpu_bytes_per_rank", 0
+            )
+        else:
+            fast_capacity_per_rank = 0
+            slow_capacity_per_rank = capacity_per_rank(
+                "cpu_bytes_to_use",
+                "cpu_bytes_to_use_per_rank",
+                DEFAULT_CPU_CAPACITY_BYTES,
+            )
+        if fast_capacity_per_rank <= 0 and slow_capacity_per_rank <= 0:
+            raise ValueError(
+                "At least one CPU offload tier must have non-zero capacity"
+            )
+
+        priority_threshold = int(extra_config.get("priority_threshold", 1))
+        generic_bandwidth = float(extra_config.get("emulated_bandwidth_gbps", 0))
+        generic_latency = float(extra_config.get("emulated_latency_us", 0))
+        fast_dma = DmaEmulationConfig(
+            bandwidth_gbps=float(
+                extra_config.get("fast_cpu_bandwidth_gbps", generic_bandwidth)
+            ),
+            latency_us=float(extra_config.get("fast_cpu_latency_us", generic_latency)),
+        )
+        slow_dma = DmaEmulationConfig(
+            bandwidth_gbps=float(
+                extra_config.get("slow_cpu_bandwidth_gbps", generic_bandwidth)
+            ),
+            latency_us=float(extra_config.get("slow_cpu_latency_us", generic_latency)),
+        )
+        if "cpu_bytes_to_use_per_rank" in extra_config and using_explicit_tiers:
+            logger.warning(
+                "cpu_bytes_to_use_per_rank is ignored when explicit fast/slow "
+                "tier capacity keys are present"
+            )
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
 
@@ -110,6 +165,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 f"expected one of {VALID_KV_OFFLOAD_BACKENDS}"
             )
         disk_mode = kv_offload_backend == "disk"
+        if disk_mode and using_explicit_tiers:
+            raise ValueError(
+                "Explicit fast/slow CPU tiers require kv_offload_backend='cpu'"
+            )
         self._cache_hit_source = (
             CacheHitSource.DISK if disk_mode else CacheHitSource.HOST
         )
@@ -152,9 +211,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s",
+            "fast_per_rank=%.2f GB, slow_per_rank=%.2f GB, "
+            "priority_threshold=%d, world_size=%d, mode=%s, "
+            "backend=%s, disk=%s",
             role.name,
-            cpu_capacity_per_rank / (1024**3),
+            fast_capacity_per_rank / (1024**3),
+            slow_capacity_per_rank / (1024**3),
+            priority_threshold,
             world_size,
             "lazy" if lazy_offload else "eager",
             kv_offload_backend,
@@ -171,23 +234,30 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self.scheduler_manager = SimpleCPUOffloadScheduler(
                 vllm_config,
                 kv_cache_config,
-                cpu_capacity_per_rank,
+                slow_capacity_per_rank,
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 lazy_offload=lazy_offload,
                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
                 use_page_cache=use_page_cache if disk_mode else False,
+                fast_cpu_capacity_bytes=fast_capacity_per_rank,
+                slow_cpu_capacity_bytes=slow_capacity_per_rank,
+                priority_threshold=priority_threshold,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
                 vllm_config,
                 kv_cache_config,
-                cpu_capacity_per_rank,
+                slow_capacity_per_rank,
                 kv_offload_backend=kv_offload_backend,
                 disk_path=disk_path,
                 disk_capacity_bytes=disk_capacity_bytes,
                 disk_buffer_slots=disk_buffer_slots,
                 use_page_cache=use_page_cache,
+                fast_cpu_capacity_bytes=fast_capacity_per_rank,
+                slow_cpu_capacity_bytes=slow_capacity_per_rank,
+                fast_dma=fast_dma,
+                slow_dma=slow_dma,
             )
 
     # --- Worker-side methods ---
@@ -195,6 +265,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.worker_handler is not None:
             self.worker_handler.register_kv_caches(kv_caches)
+
+    def shutdown(self) -> None:
+        if self.worker_handler is not None:
+            self.worker_handler.shutdown()
 
     def bind_connector_metadata(
         self,
@@ -313,7 +387,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def has_pending_push_work(self) -> bool:
         if self.scheduler_manager is not None:
-            return self.scheduler_manager.has_pending_stores()
+            return self.scheduler_manager.has_pending_transfers()
         return False
 
     def get_boundary_store_stats(self) -> BoundaryStoreStats | None:
@@ -325,6 +399,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         # Worker-side callers may invoke this hook on connectors constructed
         # via __new__ (as in test_worker.py), which lack scheduler_manager.
+        worker_handler: SimpleCPUOffloadWorker | None = getattr(
+            self, "worker_handler", None
+        )
+        if worker_handler is not None:
+            return worker_handler.get_kv_connector_stats()
         scheduler_manager: SimpleCPUOffloadScheduler | None = getattr(
             self, "scheduler_manager", None
         )

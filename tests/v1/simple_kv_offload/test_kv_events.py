@@ -10,6 +10,8 @@ is unset.
 
 from __future__ import annotations
 
+import pytest
+
 from tests.v1.simple_kv_offload.test_scheduler import (
     _BYTES_PER_BLOCK,
     BLOCK_SIZE,
@@ -60,6 +62,9 @@ from vllm.v1.simple_kv_offload.manager import (
     SimpleCPUOffloadScheduler,
     StoreRequestState,
 )
+from vllm.v1.simple_kv_offload.tier import CpuTierId
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _make_mixed_kv_cache_config(
@@ -148,6 +153,8 @@ def make_events_scheduler(
     dcp_world_size: int = 1,
     kv_cache_config: KVCacheConfig | None = None,
     enable_events: bool = True,
+    fast_cpu_blocks: int = 0,
+    slow_cpu_blocks: int | None = None,
 ) -> SchedulerFixture:
     """Build a SimpleCPUOffloadScheduler with kv cache events enabled."""
     if kv_cache_config is None:
@@ -159,6 +166,12 @@ def make_events_scheduler(
 
     virtual_block_size = BLOCK_SIZE * dcp_world_size
     cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
+    fast_capacity_bytes = _BYTES_PER_BLOCK * fast_cpu_blocks * num_groups
+    slow_capacity_bytes = (
+        None
+        if slow_cpu_blocks is None
+        else _BYTES_PER_BLOCK * slow_cpu_blocks * num_groups
+    )
 
     sched = SimpleCPUOffloadScheduler(
         vllm_config=vllm_config,
@@ -168,6 +181,8 @@ def make_events_scheduler(
         hash_block_size=virtual_block_size,
         lazy_offload=lazy,
         disk_capacity_bytes=disk_capacity_bytes,
+        fast_cpu_capacity_bytes=fast_capacity_bytes,
+        slow_cpu_capacity_bytes=slow_capacity_bytes,
     )
 
     gpu_block_pool = BlockPool(
@@ -271,6 +286,41 @@ def test_block_stored_per_group_metadata_full_attention() -> None:
     assert ev1.block_hashes == [expected_hash_1]
     assert ev1.parent_block_hash == expected_hash_0
     assert ev1.token_ids == req.prompt_token_ids[BLOCK_SIZE : 2 * BLOCK_SIZE]
+
+
+def test_multi_tier_events_identify_fast_and_slow_destinations() -> None:
+    fix = make_events_scheduler(fast_cpu_blocks=4, slow_cpu_blocks=4)
+    sched = fix.scheduler
+    requests = [
+        make_request(num_blocks=1, priority=0),
+        make_request(num_blocks=1, priority=5),
+    ]
+    blocks = [_alloc_and_register(fix, request, 1) for request in requests]
+    for request, request_blocks in zip(requests, blocks):
+        sched.update_state_after_alloc(request, request_blocks, 0)
+    output = make_scheduler_output(
+        {request.request_id: BLOCK_SIZE for request in requests},
+        new_reqs={
+            request.request_id: request_blocks.get_block_ids()
+            for request, request_blocks in zip(requests, blocks)
+        },
+    )
+
+    metadata = sched.build_connector_meta(output)
+    for transfer in metadata.store_transfers:
+        simulate_store_completion(sched, transfer.event)
+
+    stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
+    assert {event.medium for event in stored} == {"FAST_CPU", "SLOW_CPU"}
+
+    for transfer in metadata.store_transfers:
+        pool = sched.cpu_tiers[transfer.tier_id].block_pool
+        pool.evict_blocks(set(transfer.cpu_blocks))
+    removed = [
+        event for event in sched.take_events() if isinstance(event, BlockRemoved)
+    ]
+    assert {event.medium for event in removed} == {"FAST_CPU", "SLOW_CPU"}
+    assert set(sched.cpu_tiers) == {int(CpuTierId.FAST), int(CpuTierId.SLOW)}
 
 
 def test_eager_store_lora_metadata() -> None:

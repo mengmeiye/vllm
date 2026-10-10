@@ -25,6 +25,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.simple_kv_offload.copy_backend import (
+    DmaCopyBackend,
+    FailedTransferEvent,
+)
+from vllm.v1.simple_kv_offload.tier import CpuTierId, DmaEmulationConfig
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _make_kv_cache_config(num_blocks: int = 16) -> KVCacheConfig:
@@ -91,6 +98,106 @@ def test_disk_mode_rejects_non_positive_capacity() -> None:
                 "disk_capacity_bytes": 0,
             }
         )
+
+
+def test_legacy_capacity_keeps_one_slow_pool() -> None:
+    connector = _make_connector(cpu_bytes=_BYTES_PER_BLOCK * 8)
+
+    scheduler = connector.scheduler_manager
+    assert set(scheduler.cpu_tiers) == {int(CpuTierId.SLOW)}
+    assert scheduler.cpu_tiers[int(CpuTierId.SLOW)].kv_cache_config.num_blocks == 8
+
+
+def test_explicit_tiers_do_not_inherit_legacy_capacity() -> None:
+    connector = _make_connector(
+        extra_config={"fast_cpu_bytes": _BYTES_PER_BLOCK * 4},
+        cpu_bytes=_BYTES_PER_BLOCK * 8,
+    )
+
+    scheduler = connector.scheduler_manager
+    assert set(scheduler.cpu_tiers) == {int(CpuTierId.FAST)}
+    assert scheduler.cpu_tiers[int(CpuTierId.FAST)].kv_cache_config.num_blocks == 4
+
+
+def test_explicit_tier_configuration_reaches_scheduler() -> None:
+    connector = _make_connector(
+        extra_config={
+            "fast_cpu_bytes": _BYTES_PER_BLOCK * 4,
+            "slow_cpu_bytes": _BYTES_PER_BLOCK * 6,
+            "priority_threshold": 3,
+        }
+    )
+
+    scheduler = connector.scheduler_manager
+    assert scheduler.priority_threshold == 3
+    assert {
+        tier_id: tier.kv_cache_config.num_blocks
+        for tier_id, tier in scheduler.cpu_tiers.items()
+    } == {int(CpuTierId.FAST): 4, int(CpuTierId.SLOW): 6}
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {
+            "fast_cpu_bytes": -1,
+            "slow_cpu_bytes": _BYTES_PER_BLOCK * 4,
+        },
+        {
+            "fast_cpu_bytes_per_rank": -1,
+            "slow_cpu_bytes": _BYTES_PER_BLOCK * 4,
+        },
+    ],
+)
+def test_explicit_tiers_reject_negative_capacity(extra_config: dict) -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        _make_connector(extra_config=extra_config)
+
+
+def test_lazy_mode_rejects_multiple_cpu_tiers() -> None:
+    with pytest.raises(ValueError, match="lazy_offload"):
+        _make_connector(
+            extra_config={
+                "fast_cpu_bytes": _BYTES_PER_BLOCK * 4,
+                "slow_cpu_bytes": _BYTES_PER_BLOCK * 6,
+                "lazy_offload": True,
+            }
+        )
+
+
+def test_dma_service_time_and_serialization() -> None:
+    config = DmaEmulationConfig(bandwidth_gbps=2.0, latency_us=10.0)
+    assert DmaCopyBackend.emulated_service_time_seconds(1_000_000_000, config) == (
+        pytest.approx(0.50001)
+    )
+
+    backend = DmaCopyBackend(config)
+    assert backend._reserve_emulated_completion(10.0, 2.0) == 12.0
+    assert backend._reserve_emulated_completion(10.5, 1.0) == 13.0
+    assert backend._reserve_emulated_completion(20.0, 1.0) == 21.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"bandwidth_gbps": -1.0},
+        {"latency_us": -1.0},
+        {"bandwidth_gbps": float("inf")},
+        {"latency_us": float("nan")},
+    ],
+)
+def test_dma_emulation_rejects_invalid_values(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        DmaEmulationConfig(**kwargs)
+
+
+def test_background_copy_failure_is_reported() -> None:
+    event = FailedTransferEvent(ValueError("copy failed"), "FAST_CPU", True)
+
+    with pytest.raises(RuntimeError, match="FAST_CPU store DMA submission failed"):
+        event.query()
+    with pytest.raises(RuntimeError, match="FAST_CPU store DMA submission failed"):
+        event.synchronize()
 
 
 def _make_ring_kv_cache_config(num_blocks: int = 16) -> KVCacheConfig:

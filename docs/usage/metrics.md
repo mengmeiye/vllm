@@ -72,9 +72,10 @@ Caveats to keep in mind when interpreting them:
 - `used_blocks` counts blocks pinned by in-flight transfers or cache hits;
   warm cached blocks that are evictable are not counted. Use the
   `capacity_blocks` label of `simple_kv_offload_info` as the denominator.
-- Counters and gauges are quantized to engine steps. They are reported by the
-  scheduler process and reflect engine-wide logical block counts, not values
-  pooled from individual tensor-parallel workers.
+- Scheduler counters and gauges are quantized to engine steps and report
+  engine-wide logical block counts. The `simple_cpu_offload_*_total` transfer
+  counters instead come from workers, are aggregated across ranks, and carry
+  `tier` (`fast_cpu` or `slow_cpu`) and `direction` (`load` or `store`) labels.
 
 --8<-- "gen:metrics-simple-kv-offload"
 

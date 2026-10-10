@@ -37,11 +37,16 @@ from vllm.v1.simple_kv_offload.metrics import (
     _StatsKey,
 )
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 SAVE_OUTCOMES = MetricName.SAVE_OUTCOMES
 LOAD_BLOCKS = MetricName.LOAD_BLOCKS
 USED_BLOCKS = MetricName.USED_BLOCKS
 PENDING_STORE_BLOCKS = MetricName.PENDING_STORE_BLOCKS
 INFO = MetricName.INFO
+TRANSFER_BYTES = MetricName.TRANSFER_BYTES
+TRANSFER_BLOCKS = MetricName.TRANSFER_BLOCKS
+TRANSFER_OPERATIONS = MetricName.TRANSFER_OPERATIONS
 
 
 class _FakeMetric:
@@ -168,6 +173,29 @@ def test_stats_reduce_and_reset() -> None:
     assert stats.is_empty()
 
 
+def test_transfer_stats_preserve_tier_and_direction() -> None:
+    stats = SimpleCPUOffloadStats()
+    stats.record_transfer("FAST_CPU", "load", num_blocks=2, num_bytes=128)
+    stats.record_transfer("FAST_CPU", "load", num_blocks=3, num_bytes=192)
+    stats.record_transfer("SLOW_CPU", "store", num_blocks=1, num_bytes=64)
+
+    snapshot = stats.clone_and_reset()
+
+    assert stats.is_empty()
+    assert _values(snapshot, TRANSFER_OPERATIONS) == {
+        ("fast_cpu", "load"): 2,
+        ("slow_cpu", "store"): 1,
+    }
+    assert _values(snapshot, TRANSFER_BLOCKS) == {
+        ("fast_cpu", "load"): 5,
+        ("slow_cpu", "store"): 1,
+    }
+    assert _values(snapshot, TRANSFER_BYTES) == {
+        ("fast_cpu", "load"): 320,
+        ("slow_cpu", "store"): 64,
+    }
+
+
 def test_outcome_labels_match_boundary_store_stats_fields() -> None:
     """Every outcome label maps 1:1 to a BoundaryStoreStats counter field."""
     boundary_fields = {
@@ -191,6 +219,9 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
         INFO,
+        TRANSFER_BYTES,
+        TRANSFER_BLOCKS,
+        TRANSFER_OPERATIONS,
     }
     # The prom class registers literal names (required by the docs
     # generator); they must stay in sync with the emission-side constants.
@@ -200,6 +231,9 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
         INFO,
+        TRANSFER_BYTES,
+        TRANSFER_BLOCKS,
+        TRANSFER_OPERATIONS,
     }
     for metric in defs.values():
         assert metric.kwargs["documentation"]
@@ -217,6 +251,13 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
         *INFO_LABELS,
     ]
     assert defs[USED_BLOCKS].kwargs["labelnames"] == ["model_name", "engine"]
+    for metric in (TRANSFER_BYTES, TRANSFER_BLOCKS, TRANSFER_OPERATIONS):
+        assert defs[metric].kwargs["labelnames"] == [
+            "model_name",
+            "engine",
+            "tier",
+            "direction",
+        ]
 
     # mostrecent: multiprocess scrapes expose one series per label set, not
     # one pid-tagged series per writer process.
@@ -323,6 +364,16 @@ def test_connector_build_prom_metrics() -> None:
         per_engine_labelvalues={0: ["model", "0"]},
     )
     assert isinstance(prom, SimpleCPUOffloadPromMetrics)
+
+
+def test_connector_returns_worker_transfer_stats() -> None:
+    expected = SimpleCPUOffloadStats()
+    expected.record_transfer("FAST_CPU", "load", 2, 128)
+    connector = SimpleCPUOffloadConnector.__new__(SimpleCPUOffloadConnector)
+    connector.worker_handler = SimpleNamespace(get_kv_connector_stats=lambda: expected)
+    connector.scheduler_manager = None
+
+    assert connector.get_kv_connector_stats() is expected
 
 
 # ---------------------------------------------------------------------------

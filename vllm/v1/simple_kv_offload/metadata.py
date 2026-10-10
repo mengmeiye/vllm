@@ -13,6 +13,16 @@ INVALID_JOB_ID = -1
 
 
 @dataclass
+class TierStoreTransfer:
+    """One homogeneous GPU-to-host store for a single CPU tier."""
+
+    tier_id: int
+    event: int
+    gpu_blocks: list[int] = field(default_factory=list)
+    cpu_blocks: list[int] = field(default_factory=list)
+
+
+@dataclass
 class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker for CPU offload operations.
 
@@ -25,6 +35,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
+    load_cpu_tiers: list[int] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
 
@@ -32,6 +43,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     store_event: int = INVALID_JOB_ID
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)
+    store_transfers: list[TierStoreTransfer] = field(default_factory=list)
 
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False

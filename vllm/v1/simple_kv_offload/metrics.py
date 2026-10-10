@@ -27,6 +27,9 @@ class MetricName:
     USED_BLOCKS = "vllm:simple_kv_offload_used_blocks"
     PENDING_STORE_BLOCKS = "vllm:simple_kv_offload_pending_store_blocks"
     INFO = "vllm:simple_kv_offload_info"
+    TRANSFER_BYTES = "vllm:simple_cpu_offload_bytes_total"
+    TRANSFER_BLOCKS = "vllm:simple_cpu_offload_blocks_total"
+    TRANSFER_OPERATIONS = "vllm:simple_cpu_offload_operations_total"
 
 
 # outcome label value -> BoundaryStoreStats field name.
@@ -167,6 +170,21 @@ class SimpleCPUOffloadStats(KVConnectorStats):
         gauge_values = self._values.setdefault(gauge_name, {})
         gauge_values[labelvalues] = gauge_value
 
+    def record_transfer(
+        self, tier: str, direction: str, num_blocks: int, num_bytes: int
+    ) -> None:
+        """Record one physical copy submitted by a worker tier."""
+        labelvalues = (tier.lower(), direction)
+        self.increase_counter(MetricName.TRANSFER_OPERATIONS, 1, labelvalues)
+        self.increase_counter(MetricName.TRANSFER_BLOCKS, num_blocks, labelvalues)
+        self.increase_counter(MetricName.TRANSFER_BYTES, num_bytes, labelvalues)
+
+    def clone_and_reset(self) -> "SimpleCPUOffloadStats":
+        """Move the current observations into a new stats payload."""
+        snapshot = SimpleCPUOffloadStats(data=self.data)
+        self.reset()
+        return snapshot
+
 
 class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
     """Prometheus registration and recording for SimpleCPUOffloadConnector."""
@@ -199,6 +217,22 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
                 "through offload cache hits."
             ),
             labelnames=self._labelnames,
+        )
+        transfer_labels = self._labelnames + ["tier", "direction"]
+        self._counter_transfer_bytes = self._counter_cls(
+            name=MetricName.TRANSFER_BYTES,
+            documentation="Bytes copied by SimpleCPUOffloadConnector.",
+            labelnames=transfer_labels,
+        )
+        self._counter_transfer_blocks = self._counter_cls(
+            name=MetricName.TRANSFER_BLOCKS,
+            documentation="KV blocks copied by SimpleCPUOffloadConnector.",
+            labelnames=transfer_labels,
+        )
+        self._counter_transfer_operations = self._counter_cls(
+            name=MetricName.TRANSFER_OPERATIONS,
+            documentation="Copies submitted by SimpleCPUOffloadConnector.",
+            labelnames=transfer_labels,
         )
         self._gauge_used_blocks = self._gauge_cls(
             name="vllm:simple_kv_offload_used_blocks",
@@ -240,6 +274,9 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             MetricName.USED_BLOCKS: self._gauge_used_blocks,
             MetricName.PENDING_STORE_BLOCKS: self._gauge_pending_store_blocks,
             MetricName.INFO: self._gauge_info,
+            MetricName.TRANSFER_BYTES: self._counter_transfer_bytes,
+            MetricName.TRANSFER_BLOCKS: self._counter_transfer_blocks,
+            MetricName.TRANSFER_OPERATIONS: self._counter_transfer_operations,
         }
         self._num_label_values: dict[str, int] = {
             MetricName.SAVE_OUTCOMES: 1,
@@ -247,6 +284,9 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             MetricName.USED_BLOCKS: 0,
             MetricName.PENDING_STORE_BLOCKS: 0,
             MetricName.INFO: len(INFO_LABELS),
+            MetricName.TRANSFER_BYTES: 2,
+            MetricName.TRANSFER_BLOCKS: 2,
+            MetricName.TRANSFER_OPERATIONS: 2,
         }
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
