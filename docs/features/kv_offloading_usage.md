@@ -247,6 +247,10 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
+| `managed_pool` | no | `false` | Attach to a pool generation published at `root_dir` by an external pool manager (see [Managed Pools](#managed-pools)). |
+| `pool_generation` | no | — | Expected generation of the managed pool (32 lowercase hex characters). Implies `managed_pool`; startup fails if a different generation is published. |
+| `touch_on_access` | no | `managed_pool` | Refresh a block file's modification time on every store and load so an external evictor can remove the least recently used blocks first. |
+| `shutdown_drain_timeout_s` | no | `0` | Seconds shutdown waits for queued and in-flight transfers before discarding them, so a replica leaving the fleet still publishes its last blocks. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
 
@@ -276,6 +280,27 @@ The exception is the non-cryptographic `xxhash` and `xxhash_cbor` values of `--p
 
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
+```
+
+#### Managed Pools
+
+The filesystem tier never evicts, and a shared `root_dir` has no owner: deleting it while an instance writes to it, or reusing it after a configuration change, is unsafe. With `managed_pool` set, an external pool manager owns `root_dir` and vLLM only attaches to it. The manager publishes each pool generation as one directory, built under a temporary name and renamed into place once complete:
+
+```text
+<root_dir>/
+  pool.json   # {"magic": "vllm-kv-pool", "version": 1, "generation": "<32 hex>", "state": "READY", "config": {...}}
+  lock        # flock target
+  data/       # block files; used as the tier's root
+```
+
+- Attaching takes a shared `flock` on `lock` for the lifetime of the tier and then requires `state` to be `READY` (and `generation` to equal `pool_generation`, when set). The kernel releases the lock however the process exits, so a crashed instance never pins a generation.
+- The manager destroys a generation only after taking the exclusive lock without blocking, so destroy fails while any instance is attached. It sets `state` to `DESTROYING` before removing the directory, so an instance that attaches during a destroy rejects that generation.
+- Detaching never removes blocks: the pool keeps them while no instance is attached, so a restarted or newly added instance starts with the blocks its peers published.
+- With `touch_on_access`, the block files' modification times order the pool by recency across every attached instance, which lets the manager evict least recently used blocks when the pool fills.
+
+```json
+{"type": "fs", "root_dir": "/kv-pool/qwen3-8b", "managed_pool": true,
+ "shutdown_drain_timeout_s": 10}
 ```
 
 ### Object Store (OBJ)

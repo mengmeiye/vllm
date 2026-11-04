@@ -171,6 +171,23 @@ def _load_block(
             os.close(fd)
 
 
+def touch_blocks(paths: list[str]) -> None:
+    """Set each block file's modification time to now, best effort.
+
+    Pool evictors order blocks by modification time, which survives the
+    ``relatime``/``noatime`` mount options that make access times unreliable.
+    A recency hint must never fail the transfer it follows, so errors (e.g. a
+    block removed concurrently by an evictor) are logged and skipped.
+    """
+    for path in paths:
+        try:
+            os.utime(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.debug("Failed to refresh mtime of %s: %s", path, exc)
+
+
 def batch_store_block(
     paths: list[str],
     view: memoryview,

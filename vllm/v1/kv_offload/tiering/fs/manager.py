@@ -53,7 +53,9 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
     probe_o_direct,
+    touch_blocks,
 )
+from vllm.v1.kv_offload.tiering.fs.pool import PoolAttachment
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -102,6 +104,13 @@ class FileSystemTierManager(SecondaryTierManager):
         variable to the same value on all instances overrides the default seed,
         and is required to share a cache when using a non-cryptographic
         prefix-caching hash algorithm, which seeds ``NONE_HASH`` randomly.
+
+    Managed pools:
+        With ``managed_pool`` set, ``root_dir`` names a pool generation
+        published by an external pool manager (see ``fs/pool.py``). The tier
+        holds an attachment to it for its lifetime, so the manager cannot
+        destroy the generation while this process uses it, and it keeps
+        blocks under the generation's ``data`` directory.
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
@@ -116,6 +125,10 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        managed_pool: bool = False,
+        pool_generation: str | None = None,
+        touch_on_access: bool | None = None,
+        shutdown_drain_timeout_s: float = 0.0,
         backpressure_detector: BackpressureDetector | None = None,
     ):
         """Args:
@@ -131,6 +144,17 @@ class FileSystemTierManager(SecondaryTierManager):
             cache events are enabled globally (kv_events_config).
         locality: Whether this tier's storage is LOCAL or REMOTE relative
             to the publishing vLLM instance.
+        managed_pool: Attach to the pool generation published at
+            ``root_dir`` instead of using ``root_dir`` directly.
+        pool_generation: Expected generation of the managed pool. Implies
+            ``managed_pool``; attaching fails if another generation is
+            published.
+        touch_on_access: Refresh a block file's modification time whenever
+            it is stored or loaded, so an external evictor can remove the
+            least recently used blocks first. Defaults to ``managed_pool``.
+        shutdown_drain_timeout_s: How long shutdown waits for queued and
+            in-flight transfers to finish before discarding them, so a
+            replica leaving the fleet still publishes its last blocks.
         backpressure_detector: Optional backpressure detector.
 
         """
@@ -138,6 +162,22 @@ class FileSystemTierManager(SecondaryTierManager):
             offloading_spec, primary_kv_view, tier_type, backpressure_detector
         )
         self.locality = Locality(locality) if locality is not None else None
+        if shutdown_drain_timeout_s < 0:
+            raise ValueError(
+                "shutdown_drain_timeout_s must be non-negative, got "
+                f"{shutdown_drain_timeout_s}"
+            )
+        self._shutdown_drain_timeout_s = shutdown_drain_timeout_s
+        managed_pool = managed_pool or pool_generation is not None
+        self._touch_on_access = (
+            managed_pool if touch_on_access is None else touch_on_access
+        )
+        # The attachment's lock is released when the process exits, so a
+        # constructor failure below cannot pin the generation.
+        self._pool_attachment: PoolAttachment | None = None
+        if managed_pool:
+            self._pool_attachment = PoolAttachment.attach(root_dir, pool_generation)
+            root_dir = self._pool_attachment.data_dir
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -223,14 +263,24 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         self._store_jobs[job_metadata.job_id] = job_metadata
-        task = functools.partial(
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        store = functools.partial(
             batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
+            paths,
             self._primary_kv_view,
             [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
             self._block_size,
             self._use_o_direct,
         )
+        task = store
+        if self._touch_on_access:
+
+            def task() -> None:
+                store()
+                # A block another writer already published was skipped by
+                # the store; refresh it so it ages as recently used.
+                touch_blocks(paths)
+
         self._job_block_counts[job_metadata.job_id] = len(keys)
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -271,6 +321,8 @@ class FileSystemTierManager(SecondaryTierManager):
                     exc,
                 )
                 raise
+            if self._touch_on_access:
+                touch_blocks(paths)
 
         self._pool.enqueue_load(job_id, 1, [load_task])
 
@@ -348,8 +400,21 @@ class FileSystemTierManager(SecondaryTierManager):
     def shutdown(self) -> None:
         """Release resources held by this tier.
 
-        Shuts down the lookup manager and the thread pool,
-        clearing pending tasks and waiting for active threads to complete.
+        Waits up to ``shutdown_drain_timeout_s`` for queued transfers, then
+        shuts down the lookup manager and the thread pool, clearing pending
+        tasks and waiting for active threads to complete. A managed pool is
+        detached last; its blocks stay published.
         """
+        if self._shutdown_drain_timeout_s > 0 and not self._pool.wait_idle(
+            self._shutdown_drain_timeout_s
+        ):
+            logger.warning(
+                "KV offload tier '%s' still had transfers in flight after "
+                "%.1f s; discarding the queued ones.",
+                self.tier_type,
+                self._shutdown_drain_timeout_s,
+            )
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        if self._pool_attachment is not None:
+            self._pool_attachment.detach()

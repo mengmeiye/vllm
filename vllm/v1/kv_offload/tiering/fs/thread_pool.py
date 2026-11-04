@@ -135,16 +135,20 @@ class DualQueueThreadPool:
             jobs.append(self._finished_q.popleft())
         return jobs
 
-    def wait_idle(self) -> None:
-        """Block until there are no in-flight jobs.
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until there are no in-flight jobs, or until ``timeout``.
 
-        After this returns, every submitted job has had its last task
+        After this returns True, every submitted job has had its last task
         finish, so no worker thread is still copying data. Note:
         completed jobs may still be sitting in ``_finished_q`` waiting
         for ``get_finished()`` to drain them.
+
+        Returns:
+            False if ``timeout`` elapsed with jobs still in flight.
+
         """
         with self._condition:
-            self._condition.wait_for(lambda: self._inflight_jobs == 0)
+            return self._condition.wait_for(lambda: self._inflight_jobs == 0, timeout)
 
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:

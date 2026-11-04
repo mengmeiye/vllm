@@ -8,6 +8,8 @@ data integrity throughout the process.
 """
 
 import errno
+import fcntl
+import json
 import mmap
 import os
 import threading
@@ -18,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.kv_offload.tiering.fs.pool as pool_mod
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -1056,3 +1059,138 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Managed pools
+# ---------------------------------------------------------------------------
+
+_GENERATION = "0123456789abcdef0123456789abcdef"
+
+
+def _publish_pool(
+    root, generation: str = _GENERATION, state: str = pool_mod.POOL_STATE_READY
+) -> str:
+    """Lay out one pool generation the way an external pool manager does."""
+    root.mkdir()
+    (root / pool_mod.POOL_DATA_DIR).mkdir()
+    (root / pool_mod.POOL_LOCK_FILE).touch()
+    (root / pool_mod.POOL_METADATA_FILE).write_text(
+        json.dumps(
+            {
+                "magic": pool_mod.POOL_MAGIC,
+                "version": pool_mod.POOL_FORMAT_VERSION,
+                "generation": generation,
+                "state": state,
+                "config": {},
+            }
+        )
+    )
+    return str(root)
+
+
+def _managed_tier(root_dir: str, **kwargs) -> FileSystemTierManager:
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    return FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=root_dir,
+        n_read_threads=1,
+        n_write_threads=1,
+        **kwargs,
+    )
+
+
+def _try_exclusive_lock(root_dir: str) -> bool:
+    """Whether a pool manager could destroy the generation right now."""
+    fd = os.open(os.path.join(root_dir, pool_mod.POOL_LOCK_FILE), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_managed_pool_pins_generation_and_keeps_blocks_after_detach(tmp_path):
+    """An attached tier blocks destroy; detaching leaves its blocks published."""
+    root_dir = _publish_pool(tmp_path / "pool")
+    tier = _managed_tier(root_dir, pool_generation=_GENERATION)
+    try:
+        assert not _try_exclusive_lock(root_dir)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        path = tier.file_mapper.get_file_name(key(1))
+        assert path.startswith(os.path.join(root_dir, pool_mod.POOL_DATA_DIR) + "/")
+    finally:
+        tier.shutdown()
+
+    assert _try_exclusive_lock(root_dir)
+    assert os.path.exists(path)
+
+
+@pytest.mark.parametrize(
+    ("state", "generation", "match"),
+    [
+        ("DESTROYING", _GENERATION, "DESTROYING"),
+        (pool_mod.POOL_STATE_READY, "f" * 32, "expected"),
+    ],
+)
+def test_managed_pool_rejects_unattachable_generation(
+    tmp_path, state, generation, match
+):
+    """A generation being destroyed, or a replacement, must not be used."""
+    root_dir = _publish_pool(tmp_path / "pool", generation=generation, state=state)
+    with pytest.raises(RuntimeError, match=match):
+        _managed_tier(root_dir, pool_generation=_GENERATION)
+    assert _try_exclusive_lock(root_dir)
+
+
+def test_managed_pool_requires_a_published_pool(tmp_path):
+    with pytest.raises(RuntimeError, match="pool manager must create it"):
+        _managed_tier(str(tmp_path / "missing"), managed_pool=True)
+
+
+def test_touch_on_access_refreshes_block_mtime(tmp_path):
+    """Stores of already-published blocks and loads both mark a block as
+    recently used, so a pool-wide LRU evictor keeps blocks any replica uses."""
+    root_dir = _publish_pool(tmp_path / "pool")
+    tier = _managed_tier(root_dir, managed_pool=True)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        path = tier.file_mapper.get_file_name(key(1))
+
+        os.utime(path, (0, 0))
+        tier.submit_store(make_job(2, [key(1)], [1]))
+        assert all(r.success for r in drain(tier))
+        assert os.stat(path).st_mtime > 0
+
+        os.utime(path, (0, 0))
+        tier.submit_load(make_job(3, [key(1)], [2], is_promotion=True))
+        assert all(r.success for r in drain(tier))
+        assert os.stat(path).st_mtime > 0
+    finally:
+        tier.shutdown()
+
+
+def test_shutdown_drain_publishes_queued_stores(tmp_path, monkeypatch):
+    """With a drain timeout, stores queued behind a slow one still publish."""
+    import vllm.v1.kv_offload.tiering.fs.manager as manager_mod
+
+    real_store = manager_mod.batch_store_block
+
+    def slow_store(*args, **kwargs):
+        time.sleep(0.05)
+        real_store(*args, **kwargs)
+
+    monkeypatch.setattr(manager_mod, "batch_store_block", slow_store)
+    tier = _managed_tier(str(tmp_path), shutdown_drain_timeout_s=10.0)
+    keys = [key(i) for i in range(4)]
+    for i, k in enumerate(keys):
+        tier.submit_store(make_job(i, [k], [i]))
+    tier.shutdown()
+
+    assert all(os.path.exists(tier.file_mapper.get_file_name(k)) for k in keys)
